@@ -1,108 +1,220 @@
 import socket
-import json
 import threading
+import json
 import os
-from crypto import encrypt_data, decrypt_data, save_key_to_file
+import base64
+from cryptography.fernet import Fernet
 
-class SecureChatServer:
+class ChatServer:
     def __init__(self, host='0.0.0.0', port=5000):
         self.host = host
         self.port = port
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.clients = {}
-        self.messages = []
-        
-        # Получаем локальный IP-адрес
-        self.local_ip = self.get_local_ip()
-        
-        # Генерируем ключ шифрования и сохраняем его вместе с зашифрованным IP
-        self.encryption_key = save_key_to_file(self.local_ip, 'key.2pk')
-        print(f"Ключ шифрования сохранен в файл key.2pk")
-        print(f"IP-адрес сервера: {self.local_ip}")
-        
-    def get_local_ip(self):
-        """Получает локальный IP-адрес сервера"""
+        self.server_socket = None
+        self.clients = {}  # {client_socket: nickname}
+        self.encryption_key = None
+        self.load_or_create_key()
+
+    def load_or_create_key(self):
+        """Загружает существующий ключ или создает новый"""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except:
-            return self.host
+            if os.path.exists('key.2pk'):
+                print("Загрузка существующего ключа...")
+                with open('key.2pk', 'r') as f:
+                    data = json.load(f)
+                self.encryption_key = data['key'].encode()
+                print("Ключ успешно загружен")
+            else:
+                print("Создание нового ключа...")
+                self.create_new_key()
+                print("Новый ключ создан и сохранен")
+        except Exception as e:
+            print(f"Ошибка при работе с ключом: {e}")
+            print("Создание нового ключа...")
+            self.create_new_key()
+
+    def create_new_key(self):
+        """Создает новый ключ и сохраняет его"""
+        self.encryption_key = base64.urlsafe_b64encode(os.urandom(32))
         
+        # Получаем локальный IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('8.8.8.8', 80))
+            local_ip = s.getsockname()[0]
+        except Exception:
+            local_ip = '127.0.0.1'
+        finally:
+            s.close()
+
+        # Шифруем IP
+        f = Fernet(self.encryption_key)
+        encrypted_ip = f.encrypt(local_ip.encode())
+
+        # Сохраняем ключ и зашифрованный IP
+        data = {
+            'key': self.encryption_key.decode(),
+            'encrypted_ip': base64.b64encode(encrypted_ip).decode()
+        }
+        
+        with open('key.2pk', 'w') as f:
+            json.dump(data, f)
+
+    def verify_client_key(self, client_socket):
+        """Проверяет, что клиент использует правильный ключ"""
+        try:
+            print("Ожидание данных от клиента для проверки ключа...")
+            data = client_socket.recv(1024)
+            if not data:
+                print("Клиент закрыл соединение при проверке ключа")
+                return False, None
+                
+            try:
+                print(f"Получены данные для проверки: {data}")
+                f = Fernet(self.encryption_key)
+                nickname = f.decrypt(data).decode()
+                print(f"Успешная проверка ключа, никнейм: {nickname}")
+                return True, nickname
+            except Exception as e:
+                print(f"Ошибка проверки ключа: {str(e)}")
+                return False, None
+                
+        except Exception as e:
+            print(f"Ошибка при получении данных для проверки ключа: {str(e)}")
+            return False, None
+
     def start(self):
         """Запускает сервер"""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
         try:
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
             print(f"Сервер запущен на {self.host}:{self.port}")
-            print("Ожидание подключений...")
             
             while True:
                 client_socket, address = self.server_socket.accept()
-                print(f"Новое подключение от {address}")
-                client_thread = threading.Thread(target=self.handle_client, args=(client_socket, address))
-                client_thread.start()
+                print(f"Новое подключение с {address}")
+                
+                # Проверяем ключ клиента
+                is_valid, nickname = self.verify_client_key(client_socket)
+                
+                if is_valid and nickname:
+                    print(f"Клиент {nickname} успешно подключен")
+                    self.clients[client_socket] = nickname
+                    
+                    # Отправляем приветственное сообщение
+                    welcome_msg = f"Добро пожаловать, {nickname}!"
+                    self.send_encrypted_message(client_socket, welcome_msg)
+                    
+                    # Оповещаем всех о новом участнике
+                    self.broadcast_message(f"{nickname} присоединился к чату", client_socket)
+                    
+                    # Запускаем поток для обработки сообщений клиента
+                    thread = threading.Thread(target=self.handle_client, args=(client_socket,))
+                    thread.daemon = True
+                    thread.start()
+                else:
+                    print(f"Клиент {address} использует неверный ключ")
+                    client_socket.close()
+                    
         except Exception as e:
-            print(f"Ошибка запуска сервера: {e}")
-            
-    def handle_client(self, client_socket, address):
-        """Обрабатывает подключение клиента"""
+            print(f"Ошибка сервера: {e}")
+        finally:
+            if self.server_socket:
+                self.server_socket.close()
+
+    def handle_client(self, client_socket):
+        """Обрабатывает сообщения от клиента"""
+        f = Fernet(self.encryption_key)
+        
         try:
-            # Получаем никнейм клиента
-            nickname = decrypt_data(client_socket.recv(1024), self.encryption_key)
-            self.clients[client_socket] = nickname
-            print(f"Клиент {address} подключился как {nickname}")
-            
-            # Отправляем приветственное сообщение
-            welcome_message = f"Добро пожаловать в чат, {nickname}!"
-            client_socket.send(encrypt_data(welcome_message, self.encryption_key))
-            
             while True:
-                # Получаем сообщение от клиента
-                message = decrypt_data(client_socket.recv(1024), self.encryption_key)
-                if not message:
+                try:
+                    data = client_socket.recv(1024)
+                    if not data:
+                        print("Клиент закрыл соединение")
+                        break
+                        
+                    print(f"Получены данные от клиента: {data}")
+                    
+                    # Расшифровываем сообщение
+                    decrypted_message = f.decrypt(data).decode()
+                    print(f"Расшифровано сообщение: {decrypted_message}")
+                    
+                    # Формируем сообщение с никнеймом
+                    nickname = self.clients.get(client_socket, "Unknown")
+                    full_message = f"{nickname}: {decrypted_message}"
+                    print(f"Подготовлено сообщение для рассылки: {full_message}")
+                    
+                    # Отправляем всем, включая отправителя
+                    encrypted_message = f.encrypt(full_message.encode())
+                    for client in self.clients:
+                        try:
+                            print(f"Отправка сообщения клиенту {self.clients[client]}")
+                            client.send(encrypted_message)
+                            print(f"Сообщение успешно отправлено клиенту {self.clients[client]}")
+                        except Exception as e:
+                            print(f"Ошибка отправки клиенту {self.clients[client]}: {e}")
+                            
+                except Exception as e:
+                    print(f"Ошибка обработки сообщения: {str(e)}")
                     break
                     
-                # Формируем сообщение с никнеймом
-                full_message = f"{nickname}: {message}"
-                print(f"Сообщение от {nickname}: {message}")
-                self.messages.append(full_message)
-                
-                # Отправляем сообщение всем клиентам
-                self.broadcast_message(full_message)
-                
         except Exception as e:
-            print(f"Ошибка при обработке клиента {address}: {e}")
+            print(f"Ошибка соединения с клиентом: {str(e)}")
         finally:
-            if client_socket in self.clients:
-                nickname = self.clients[client_socket]
-                print(f"Клиент {nickname} ({address}) отключился")
-                del self.clients[client_socket]
-            client_socket.close()
-            
-    def broadcast_message(self, message):
-        """Отправляет сообщение всем подключенным клиентам"""
-        encrypted_message = encrypt_data(message, self.encryption_key)
-        disconnected_clients = []
+            self.remove_client(client_socket)
+
+    def broadcast_message(self, message, sender_socket=None):
+        """Отправляет сообщение всем клиентам"""
+        print(f"Рассылка сообщения: {message}")
+        f = Fernet(self.encryption_key)
+        encrypted_message = f.encrypt(message.encode())
+        print(f"Зашифрованное сообщение для рассылки: {encrypted_message}")
         
-        for client in self.clients:
+        # Создаем копию списка клиентов, чтобы избежать изменения во время итерации
+        clients = list(self.clients.items())
+        
+        for client_socket, nickname in clients:
             try:
-                client.send(encrypted_message)
-            except:
-                disconnected_clients.append(client)
-                
-        # Удаляем отключившихся клиентов
-        for client in disconnected_clients:
-            if client in self.clients:
-                del self.clients[client]
+                print(f"Отправка сообщения клиенту {nickname}")
+                client_socket.send(encrypted_message)
+                print(f"Сообщение успешно отправлено клиенту {nickname}")
+            except Exception as e:
+                print(f"Ошибка отправки клиенту {nickname}: {e}")
+                self.remove_client(client_socket)
+
+    def send_encrypted_message(self, client_socket, message):
+        """Отправляет зашифрованное сообщение конкретному клиенту"""
+        try:
+            f = Fernet(self.encryption_key)
+            encrypted_message = f.encrypt(message.encode())
+            client_socket.send(encrypted_message)
+        except Exception as e:
+            print(f"Ошибка отправки сообщения: {e}")
+
+    def remove_client(self, client_socket):
+        """Удаляет клиента и оповещает остальных"""
+        if client_socket in self.clients:
+            nickname = self.clients[client_socket]
+            del self.clients[client_socket]
+            client_socket.close()
+            self.broadcast_message(f"{nickname} покинул чат")
+            print(f"Клиент {nickname} отключен")
+
+    def stop(self):
+        """Останавливает сервер"""
+        if self.server_socket:
+            self.server_socket.close()
+        for client_socket in list(self.clients.keys()):
+            client_socket.close()
+        print("Сервер остановлен")
 
 if __name__ == "__main__":
+    server = ChatServer()
     try:
-        server = SecureChatServer()
         server.start()
     except KeyboardInterrupt:
-        print("\nСервер остановлен")
-    except Exception as e:
-        print(f"Критическая ошибка: {e}") 
+        print("\nОстановка сервера...")
+        server.stop() 

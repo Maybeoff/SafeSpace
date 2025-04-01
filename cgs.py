@@ -1,105 +1,19 @@
 import sys
-import random
-import string
-import hashlib
-import os
-import json
 import socket
 import threading
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import os
+import json
 import base64
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QPushButton, QTextEdit, QLineEdit, 
-                             QLabel, QFileDialog, QMessageBox, QInputDialog)
-from PySide6.QtCore import Qt, QThread, Signal
+                            QHBoxLayout, QTextEdit, QLineEdit, QPushButton, 
+                            QLabel, QMessageBox, QInputDialog, QFileDialog)
+from PySide6.QtCore import Qt, Signal, QObject, Slot
+from cryptography.fernet import Fernet
 
-# Crypto functions
-def generate_encryption_key():
-    """Генерирует ключ шифрования"""
-    return base64.urlsafe_b64encode(os.urandom(32))
-
-def encrypt_ip(ip, key):
-    """Шифрует IP-адрес с помощью ключа"""
-    f = Fernet(key)
-    return f.encrypt(ip.encode())
-
-def decrypt_ip(encrypted_ip, key):
-    """Расшифровывает IP-адрес с помощью ключа"""
-    f = Fernet(key)
-    return f.decrypt(encrypted_ip).decode()
-
-def encrypt_data(data, key):
-    """Шифрует данные с использованием ключа"""
-    if isinstance(key, str):
-        key = key.encode()
-    if isinstance(data, str):
-        data = data.encode()
-    f = Fernet(key)
-    return f.encrypt(data)
-
-def decrypt_data(encrypted_data, key):
-    """Расшифровывает данные с использованием ключа"""
-    if isinstance(key, str):
-        key = key.encode()
-    f = Fernet(key)
-    decrypted_data = f.decrypt(encrypted_data)
-    return decrypted_data.decode()
-
-def save_key_to_file(server_ip, filename):
-    """Сохраняет ключ и зашифрованный IP в файл"""
-    key = generate_encryption_key()
-    encrypted_ip = encrypt_ip(server_ip, key)
-    data = {
-        'key': key.decode(),
-        'encrypted_ip': base64.b64encode(encrypted_ip).decode()
-    }
-    with open(filename, 'w') as f:
-        json.dump(data, f)
-    return key
-
-def load_key_from_file(filename):
-    """Загружает ключ и расшифровывает IP из файла"""
-    with open(filename, 'r') as f:
-        data = json.load(f)
-    key = data['key'].encode()
-    encrypted_ip = base64.b64decode(data['encrypted_ip'])
-    ip = decrypt_ip(encrypted_ip, key)
-    return key, ip
-
-def generate_password():
-    """Генерирует случайный пароль"""
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-
-# Network Thread
-class NetworkThread(QThread):
+class SignalHandler(QObject):
     message_received = Signal(str)
-    connection_lost = Signal()
+    connection_status = Signal(str)
 
-    def __init__(self, socket, encryption_key):
-        super().__init__()
-        self.socket = socket
-        self.encryption_key = encryption_key
-        self.running = True
-
-    def run(self):
-        while self.running:
-            try:
-                data = self.socket.recv(1024)
-                if not data:
-                    break
-                decrypted_message = decrypt_data(data, self.encryption_key)
-                self.message_received.emit(decrypted_message)
-            except:
-                break
-        self.running = False
-        self.connection_lost.emit()
-
-    def stop(self):
-        self.running = False
-
-# Main Window
 class ChatWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -108,8 +22,8 @@ class ChatWindow(QMainWindow):
         
         self.client_socket = None
         self.encryption_key = None
-        self.network_thread = None
-        
+        self.server_ip = None
+        self.signal_handler = SignalHandler()
         self.setup_ui()
         
     def setup_ui(self):
@@ -154,20 +68,52 @@ class ChatWindow(QMainWindow):
         self.status_label = QLabel("Статус: Отключено")
         layout.addWidget(self.status_label)
         
+        # Подключаем сигналы
+        self.signal_handler.message_received.connect(self.display_message)
+        self.signal_handler.connection_status.connect(self.update_status)
+        
     def select_key_file(self):
         try:
-            filename, _ = QFileDialog.getOpenFileName(self, "Выберите файл ключа", "", "Key Files (*.2pk)")
-            if filename:
-                self.encryption_key, self.server_ip = load_key_from_file(filename)
-                self.key_label.setText(f"Выбран файл: {filename}")
-                self.connect_button.setEnabled(True)
-                self.add_to_chat("Файл ключа успешно загружен")
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Выберите файл key.2pk",
+                "",
+                "Key files (*.2pk)"
+            )
+            
+            if not file_path:
+                return
+                
+            if not os.path.exists(file_path):
+                QMessageBox.critical(self, "Ошибка", "Файл не существует!")
+                return
+                
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                
+            if 'key' not in data or 'encrypted_ip' not in data:
+                QMessageBox.critical(self, "Ошибка", "Неверный формат файла ключа")
+                return
+                
+            self.encryption_key = data['key'].encode()
+            encrypted_ip = base64.b64decode(data['encrypted_ip'])
+            
+            f = Fernet(self.encryption_key)
+            self.server_ip = f.decrypt(encrypted_ip).decode()
+            
+            self.key_label.setText(f"Выбран файл: {file_path}")
+            self.connect_button.setEnabled(True)
+            self.status_label.setText("Статус: Файл ключа загружен")
+            self.chat_area.append("Файл ключа успешно загружен")
+            
+        except json.JSONDecodeError:
+            QMessageBox.critical(self, "Ошибка", "Файл ключа поврежден или имеет неверный формат")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить файл ключа: {str(e)}")
             
     def connect_to_server(self):
         try:
-            if not self.encryption_key:
+            if not self.encryption_key or not self.server_ip:
                 QMessageBox.warning(self, "Ошибка", "Сначала выберите файл ключа!")
                 return
                 
@@ -176,27 +122,26 @@ class ChatWindow(QMainWindow):
             self.client_socket.connect((self.server_ip, 5000))
             self.client_socket.settimeout(None)
             
-            # Запрашиваем никнейм
-            nickname, ok = QInputDialog.getText(self, "Никнейм", "Введите ваш никнейм:")
+            nickname, ok = QInputDialog.getText(self, 'Никнейм', 'Введите ваш никнейм:')
             if ok and nickname:
-                self.client_socket.send(encrypt_data(nickname, self.encryption_key))
+                self.nickname = nickname
+                f = Fernet(self.encryption_key)
+                self.client_socket.send(f.encrypt(nickname.encode()))
+                self.signal_handler.connection_status.emit("Подключено")
                 
-                # Включаем элементы интерфейса
                 self.message_input.setEnabled(True)
                 self.send_button.setEnabled(True)
-                self.connect_button.setEnabled(False)
                 self.key_button.setEnabled(False)
+                self.connect_button.setEnabled(False)
                 
-                # Запускаем поток для получения сообщений
-                self.network_thread = NetworkThread(self.client_socket, self.encryption_key)
-                self.network_thread.message_received.connect(self.add_to_chat)
-                self.network_thread.connection_lost.connect(self.handle_connection_lost)
-                self.network_thread.start()
+                receive_thread = threading.Thread(target=self.receive_messages)
+                receive_thread.daemon = True
+                receive_thread.start()
                 
-                self.add_to_chat("Успешно подключено к серверу")
-                self.status_label.setText("Статус: Подключено")
+                self.chat_area.append("Успешно подключено к серверу")
             else:
-                self.client_socket.close()
+                if self.client_socket:
+                    self.client_socket.close()
                 self.client_socket = None
                 
         except socket.timeout:
@@ -206,42 +151,93 @@ class ChatWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось подключиться к серверу: {str(e)}")
             
+    def receive_messages(self):
+        f = Fernet(self.encryption_key)
+        while True:
+            try:
+                data = self.client_socket.recv(1024)
+                if not data:
+                    print("Соединение закрыто сервером")
+                    self.signal_handler.connection_status.emit("Соединение потеряно")
+                    break
+                    
+                try:
+                    message = f.decrypt(data).decode()
+                    print(f"Получено сообщение: {message}")
+                    self.signal_handler.message_received.emit(message)
+                except Exception as decrypt_error:
+                    print(f"Ошибка расшифровки: {decrypt_error}")
+            except Exception as e:
+                print(f"Ошибка получения сообщения: {str(e)}")
+                self.signal_handler.connection_status.emit("Соединение потеряно")
+                break
+                
     def send_message(self):
         message = self.message_input.text().strip()
         if message:
             try:
-                if not self.client_socket:
-                    raise Exception("Соединение потеряно")
-                self.client_socket.send(encrypt_data(message, self.encryption_key))
-                self.message_input.clear()
-            except:
-                self.handle_connection_lost()
+                if not self.client_socket or not self.client_socket.fileno() != -1:
+                    # Пробуем переподключиться
+                    try:
+                        print("Попытка переподключения...")
+                        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        self.client_socket.settimeout(5)
+                        self.client_socket.connect((self.server_ip, 5000))
+                        self.client_socket.settimeout(None)
+                        
+                        # Повторно отправляем никнейм
+                        self.client_socket.send(Fernet(self.encryption_key).encrypt(self.nickname.encode()))
+                        print("Переподключение успешно")
+                        
+                        # Перезапускаем поток приема сообщений
+                        receive_thread = threading.Thread(target=self.receive_messages)
+                        receive_thread.daemon = True
+                        receive_thread.start()
+                        
+                    except Exception as reconnect_error:
+                        raise Exception(f"Не удалось переподключиться: {str(reconnect_error)}")
+                    
+                print(f"Отправка сообщения: {message}")
+                encrypted_message = Fernet(self.encryption_key).encrypt(message.encode())
+                print(f"Зашифрованное сообщение: {encrypted_message}")
                 
-    def add_to_chat(self, message):
+                self.client_socket.send(encrypted_message)
+                print("Сообщение отправлено")
+                
+                self.message_input.clear()
+                
+            except Exception as e:
+                print(f"Ошибка отправки: {str(e)}")
+                QMessageBox.warning(self, "Ошибка", f"Не удалось отправить сообщение: {str(e)}")
+                self.signal_handler.connection_status.emit("Соединение потеряно")
+                
+    @Slot(str)
+    def display_message(self, message):
+        """Отображает сообщение в чате"""
+        print(f"Отображение сообщения: {message}")
         self.chat_area.append(message)
+        # Прокручиваем чат вниз
+        self.chat_area.verticalScrollBar().setValue(
+            self.chat_area.verticalScrollBar().maximum()
+        )
         
-    def handle_connection_lost(self):
-        self.message_input.setEnabled(False)
-        self.send_button.setEnabled(False)
-        self.key_button.setEnabled(True)
-        self.connect_button.setEnabled(False)
-        self.status_label.setText("Статус: Соединение потеряно")
-        self.add_to_chat("Соединение потеряно")
-        
-        if self.network_thread:
-            self.network_thread.stop()
-            self.network_thread = None
-            
-        if self.client_socket:
-            try:
-                self.client_socket.close()
-            except:
-                pass
-            self.client_socket = None
+    @Slot(str)
+    def update_status(self, status):
+        self.status_label.setText(f"Статус: {status}")
+        if status == "Соединение потеряно":
+            self.message_input.setEnabled(False)
+            self.send_button.setEnabled(False)
+            self.key_button.setEnabled(True)
+            self.connect_button.setEnabled(True)
+            if self.client_socket:
+                try:
+                    self.client_socket.close()
+                except:
+                    pass
+                self.client_socket = None
+            self.chat_area.append("Соединение потеряно")
             
     def closeEvent(self, event):
-        if self.network_thread:
-            self.network_thread.stop()
         if self.client_socket:
             try:
                 self.client_socket.close()
@@ -256,4 +252,4 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
-    main()
+    main() 
