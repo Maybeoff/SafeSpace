@@ -13,12 +13,24 @@ from PySide6.QtCore import Qt, Signal, QObject, Slot, QTimer, QUrl
 from PySide6.QtGui import QIcon
 from PySide6.QtMultimedia import QSoundEffect
 from cryptography.fernet import Fernet
+import pystray
+from pystray import MenuItem, Icon
+from PIL import Image, ImageDraw
+
+def resource_path(relative_path):
+    """Получает абсолютный путь к ресурсу"""
+    try:
+        # PyInstaller создает временную папку и хранит путь в _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 class SignalHandler(QObject):
     message_received = Signal(str)
     connection_status = Signal(str)
     notification = Signal(str)
-    play_sound = Signal()  # Новый сигнал для воспроизведения звука
+    play_sound = Signal()
 
 class ChatWindow(QMainWindow):
     def __init__(self):
@@ -87,7 +99,7 @@ class ChatWindow(QMainWindow):
     def setup_notifications(self):
         """Настройка системы уведомлений"""
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon("icon.png"))  # Убедитесь, что у вас есть файл icon.png
+        self.tray_icon.setIcon(QIcon("icon.jpg"))  # Убедитесь, что у вас есть файл icon.png
         self.tray_icon.show()
         
         # Создаем меню для трея
@@ -105,13 +117,13 @@ class ChatWindow(QMainWindow):
 
     def show_notification(self, message):
         """Показывает уведомление в системном трее"""
+        print(f"Показываем уведомление: {message}")  # Логирование уведомления
         self.tray_icon.showMessage(
             "SafeSpace",
             message,
             QSystemTrayIcon.Information,
-            3000
+            0  # Установите время на 0, чтобы уведомление не скрывалось автоматически
         )
-        self.notification_timer.start(3000)
 
     def select_key_file(self):
         try:
@@ -158,6 +170,9 @@ class ChatWindow(QMainWindow):
                 QMessageBox.warning(self, "Ошибка", "Сначала выберите файл ключа!")
                 return
                 
+            if self.client_socket is not None:
+                self.client_socket.close()  # Закрываем старое соединение, если оно существует
+
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.settimeout(5)
             self.client_socket.connect((self.server_ip, 5000))
@@ -175,10 +190,12 @@ class ChatWindow(QMainWindow):
                 self.key_button.setEnabled(False)
                 self.connect_button.setEnabled(False)
                 
-                receive_thread = threading.Thread(target=self.receive_messages)
-                receive_thread.daemon = True
-                receive_thread.start()
-                
+                # Запускаем поток для получения сообщений только один раз
+                if not hasattr(self, 'receive_thread') or not self.receive_thread.is_alive():
+                    self.receive_thread = threading.Thread(target=self.receive_messages)
+                    self.receive_thread.daemon = True
+                    self.receive_thread.start()
+                    
                 self.chat_area.append("Успешно подключено к серверу")
             else:
                 if self.client_socket:
@@ -195,47 +212,64 @@ class ChatWindow(QMainWindow):
     def setup_sound(self):
         """Настройка звука"""
         try:
-            # Проверяем наличие файла звука
-            if not os.path.exists("newmaseg.wav"):
-                print("Файл звука newmaseg.wav не найден")
+            # Получаем путь к звуковому файлу
+            sound_path = resource_path("newmaseg.wav")
+            print(f"Путь к звуковому файлу: {sound_path}")
+            
+            if not os.path.exists(sound_path):
+                print("Файл звука не найден")
                 return
                 
             # Пробуем инициализировать QSoundEffect
             try:
                 self.message_sound = QSoundEffect()
-                self.message_sound.setSource(QUrl.fromLocalFile("newmaseg.wav"))
+                self.message_sound.setSource(QUrl.fromLocalFile(sound_path))
                 self.message_sound.setVolume(1.0)
                 self.use_qsound = True
-            except:
-                print("Не удалось инициализировать QSoundEffect, будет использован playsound")
+                print("QSoundEffect успешно инициализирован")
+            except Exception as e:
+                print(f"Не удалось инициализировать QSoundEffect: {str(e)}")
                 self.use_qsound = False
                 
         except Exception as e:
             print(f"Ошибка при настройке звука: {str(e)}")
             self.use_qsound = False
 
+    def add_message_to_history(self, message):
+        """Добавляет сообщение в историю (до 100 последних сообщений)."""
+        if not hasattr(self, 'message_history'):
+            self.message_history = []  # Инициализируем историю сообщений
+        if len(self.message_history) >= 100:
+            self.message_history.pop(0)  # Удаляем старое сообщение
+        self.message_history.append(message)
+
     def play_message_sound(self):
         """Воспроизводит звук нового сообщения"""
         try:
-            if not os.path.exists("newmaseg.wav"):
+            # Получаем путь к звуковому файлу
+            sound_path = resource_path("newmaseg.wav")
+            
+            if not os.path.exists(sound_path):
+                print("Файл звука не найден")
                 return
                 
             if hasattr(self, 'use_qsound') and self.use_qsound:
                 try:
                     self.message_sound.play()
-                except:
+                except Exception as e:
+                    print(f"Ошибка воспроизведения через QSoundEffect: {str(e)}")
                     self.use_qsound = False
-                    self._play_sound_with_playsound()
+                    self._play_sound_with_playsound(sound_path)
             else:
-                self._play_sound_with_playsound()
+                self._play_sound_with_playsound(sound_path)
                 
         except Exception as e:
             print(f"Ошибка воспроизведения звука: {str(e)}")
             
-    def _play_sound_with_playsound(self):
+    def _play_sound_with_playsound(self, sound_path):
         """Воспроизводит звук с помощью playsound"""
         try:
-            threading.Thread(target=playsound, args=("newmaseg.wav",), daemon=True).start()
+            threading.Thread(target=playsound, args=(sound_path,), daemon=True).start()
         except Exception as e:
             print(f"Ошибка воспроизведения звука через playsound: {str(e)}")
 
@@ -253,23 +287,16 @@ class ChatWindow(QMainWindow):
                     message = f.decrypt(data).decode()
                     print(f"Получено сообщение: {message}")
                     
-                    # Обработка истории сообщений (только для новых серверов)
-                    if message.startswith("HISTORY:"):
-                        try:
-                            history = json.loads(message[8:])
-                            for msg in history:
-                                self.signal_handler.message_received.emit(msg)
-                            continue
-                        except json.JSONDecodeError:
-                            pass
-                        
-                    # Обычное сообщение
+                    # Добавляем сообщение в историю
+                    self.add_message_to_history(message)
+                    
                     self.signal_handler.message_received.emit(message)
                     self.signal_handler.play_sound.emit()
                     
                     if not self.isActiveWindow():
+                        print("Показываем уведомление")
                         self.signal_handler.notification.emit(message)
-                        
+                        self.show_notification(message)
                 except Exception as decrypt_error:
                     print(f"Ошибка расшифровки: {decrypt_error}")
                     
@@ -290,7 +317,7 @@ class ChatWindow(QMainWindow):
         message = self.message_input.text().strip()
         if message:
             try:
-                if not self.client_socket or not self.client_socket.fileno() != -1:
+                if not self.client_socket or self.client_socket.fileno() == -1:
                     # Пробуем переподключиться
                     try:
                         print("Попытка переподключения...")
@@ -310,7 +337,7 @@ class ChatWindow(QMainWindow):
                         
                     except Exception as reconnect_error:
                         raise Exception(f"Не удалось переподключиться: {str(reconnect_error)}")
-                    
+                
                 print(f"Отправка сообщения: {message}")
                 encrypted_message = Fernet(self.encryption_key).encrypt(message.encode())
                 print(f"Зашифрованное сообщение: {encrypted_message}")
