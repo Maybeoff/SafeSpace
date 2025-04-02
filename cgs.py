@@ -4,15 +4,21 @@ import threading
 import os
 import json
 import base64
+from playsound import playsound
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QTextEdit, QLineEdit, QPushButton, 
-                            QLabel, QMessageBox, QInputDialog, QFileDialog)
-from PySide6.QtCore import Qt, Signal, QObject, Slot
+                            QLabel, QMessageBox, QInputDialog, QFileDialog,
+                            QSystemTrayIcon, QMenu)
+from PySide6.QtCore import Qt, Signal, QObject, Slot, QTimer, QUrl
+from PySide6.QtGui import QIcon
+from PySide6.QtMultimedia import QSoundEffect
 from cryptography.fernet import Fernet
 
 class SignalHandler(QObject):
     message_received = Signal(str)
     connection_status = Signal(str)
+    notification = Signal(str)
+    play_sound = Signal()  # Новый сигнал для воспроизведения звука
 
 class ChatWindow(QMainWindow):
     def __init__(self):
@@ -25,6 +31,11 @@ class ChatWindow(QMainWindow):
         self.server_ip = None
         self.signal_handler = SignalHandler()
         self.setup_ui()
+        self.setup_notifications()
+        self.setup_sound()
+        
+        # Подключаем сигнал для воспроизведения звука
+        self.signal_handler.play_sound.connect(self.play_message_sound)
         
     def setup_ui(self):
         central_widget = QWidget()
@@ -71,7 +82,37 @@ class ChatWindow(QMainWindow):
         # Подключаем сигналы
         self.signal_handler.message_received.connect(self.display_message)
         self.signal_handler.connection_status.connect(self.update_status)
+        self.signal_handler.notification.connect(self.show_notification)
+
+    def setup_notifications(self):
+        """Настройка системы уведомлений"""
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QIcon("icon.png"))  # Убедитесь, что у вас есть файл icon.png
+        self.tray_icon.show()
         
+        # Создаем меню для трея
+        tray_menu = QMenu()
+        show_action = tray_menu.addAction("Показать")
+        show_action.triggered.connect(self.show)
+        quit_action = tray_menu.addAction("Выход")
+        quit_action.triggered.connect(self.close)
+        self.tray_icon.setContextMenu(tray_menu)
+        
+        # Таймер для автоматического скрытия уведомлений
+        self.notification_timer = QTimer()
+        self.notification_timer.setSingleShot(True)
+        self.notification_timer.timeout.connect(self.tray_icon.hide)
+
+    def show_notification(self, message):
+        """Показывает уведомление в системном трее"""
+        self.tray_icon.showMessage(
+            "SafeSpace",
+            message,
+            QSystemTrayIcon.Information,
+            3000
+        )
+        self.notification_timer.start(3000)
+
     def select_key_file(self):
         try:
             file_path, _ = QFileDialog.getOpenFileName(
@@ -151,11 +192,58 @@ class ChatWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось подключиться к серверу: {str(e)}")
             
+    def setup_sound(self):
+        """Настройка звука"""
+        try:
+            # Проверяем наличие файла звука
+            if not os.path.exists("newmaseg.wav"):
+                print("Файл звука newmaseg.wav не найден")
+                return
+                
+            # Пробуем инициализировать QSoundEffect
+            try:
+                self.message_sound = QSoundEffect()
+                self.message_sound.setSource(QUrl.fromLocalFile("newmaseg.wav"))
+                self.message_sound.setVolume(1.0)
+                self.use_qsound = True
+            except:
+                print("Не удалось инициализировать QSoundEffect, будет использован playsound")
+                self.use_qsound = False
+                
+        except Exception as e:
+            print(f"Ошибка при настройке звука: {str(e)}")
+            self.use_qsound = False
+
+    def play_message_sound(self):
+        """Воспроизводит звук нового сообщения"""
+        try:
+            if not os.path.exists("newmaseg.wav"):
+                return
+                
+            if hasattr(self, 'use_qsound') and self.use_qsound:
+                try:
+                    self.message_sound.play()
+                except:
+                    self.use_qsound = False
+                    self._play_sound_with_playsound()
+            else:
+                self._play_sound_with_playsound()
+                
+        except Exception as e:
+            print(f"Ошибка воспроизведения звука: {str(e)}")
+            
+    def _play_sound_with_playsound(self):
+        """Воспроизводит звук с помощью playsound"""
+        try:
+            threading.Thread(target=playsound, args=("newmaseg.wav",), daemon=True).start()
+        except Exception as e:
+            print(f"Ошибка воспроизведения звука через playsound: {str(e)}")
+
     def receive_messages(self):
         f = Fernet(self.encryption_key)
         while True:
             try:
-                data = self.client_socket.recv(1024)
+                data = self.client_socket.recv(4096)
                 if not data:
                     print("Соединение закрыто сервером")
                     self.signal_handler.connection_status.emit("Соединение потеряно")
@@ -164,9 +252,35 @@ class ChatWindow(QMainWindow):
                 try:
                     message = f.decrypt(data).decode()
                     print(f"Получено сообщение: {message}")
+                    
+                    # Обработка истории сообщений (только для новых серверов)
+                    if message.startswith("HISTORY:"):
+                        try:
+                            history = json.loads(message[8:])
+                            for msg in history:
+                                self.signal_handler.message_received.emit(msg)
+                            continue
+                        except json.JSONDecodeError:
+                            pass
+                        
+                    # Обычное сообщение
                     self.signal_handler.message_received.emit(message)
+                    self.signal_handler.play_sound.emit()
+                    
+                    if not self.isActiveWindow():
+                        self.signal_handler.notification.emit(message)
+                        
                 except Exception as decrypt_error:
                     print(f"Ошибка расшифровки: {decrypt_error}")
+                    
+            except ConnectionResetError:
+                print("Соединение было сброшено сервером")
+                self.signal_handler.connection_status.emit("Соединение потеряно")
+                break
+            except ConnectionAbortedError:
+                print("Соединение было прервано")
+                self.signal_handler.connection_status.emit("Соединение потеряно")
+                break
             except Exception as e:
                 print(f"Ошибка получения сообщения: {str(e)}")
                 self.signal_handler.connection_status.emit("Соединение потеряно")
@@ -211,17 +325,6 @@ class ChatWindow(QMainWindow):
                 QMessageBox.warning(self, "Ошибка", f"Не удалось отправить сообщение: {str(e)}")
                 self.signal_handler.connection_status.emit("Соединение потеряно")
                 
-    @Slot(str)
-    def display_message(self, message):
-        """Отображает сообщение в чате"""
-        print(f"Отображение сообщения: {message}")
-        self.chat_area.append(message)
-        # Прокручиваем чат вниз
-        self.chat_area.verticalScrollBar().setValue(
-            self.chat_area.verticalScrollBar().maximum()
-        )
-        
-    @Slot(str)
     def update_status(self, status):
         self.status_label.setText(f"Статус: {status}")
         if status == "Соединение потеряно":
@@ -236,7 +339,17 @@ class ChatWindow(QMainWindow):
                     pass
                 self.client_socket = None
             self.chat_area.append("Соединение потеряно")
-            
+
+    @Slot(str)
+    def display_message(self, message):
+        """Отображает сообщение в чате"""
+        print(f"Отображение сообщения: {message}")
+        self.chat_area.append(message)
+        # Прокручиваем чат вниз
+        self.chat_area.verticalScrollBar().setValue(
+            self.chat_area.verticalScrollBar().maximum()
+        )
+        
     def closeEvent(self, event):
         if self.client_socket:
             try:

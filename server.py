@@ -12,6 +12,8 @@ class ChatServer:
         self.server_socket = None
         self.clients = {}  # {client_socket: nickname}
         self.encryption_key = None
+        self.message_history = []  # История сообщений
+        self.max_history = 100  # Максимальное количество сообщений в истории
         self.load_or_create_key()
 
     def load_or_create_key(self):
@@ -129,9 +131,14 @@ class ChatServer:
         f = Fernet(self.encryption_key)
         
         try:
+            # Отправляем историю сообщений новому клиенту
+            if self.message_history:
+                history_message = "HISTORY:" + json.dumps(self.message_history)
+                self.send_encrypted_message(client_socket, history_message)
+            
             while True:
                 try:
-                    data = client_socket.recv(1024)
+                    data = client_socket.recv(4096)  # Увеличиваем размер буфера для файлов
                     if not data:
                         print("Клиент закрыл соединение")
                         break
@@ -142,21 +149,20 @@ class ChatServer:
                     decrypted_message = f.decrypt(data).decode()
                     print(f"Расшифровано сообщение: {decrypted_message}")
                     
-                    # Формируем сообщение с никнеймом
-                    nickname = self.clients.get(client_socket, "Unknown")
-                    full_message = f"{nickname}: {decrypted_message}"
-                    print(f"Подготовлено сообщение для рассылки: {full_message}")
+                    # Проверяем тип сообщения
+                    if decrypted_message.startswith("FILE:"):
+                        # Обработка файла
+                        file_data = json.loads(decrypted_message[5:])
+                        file_message = f"FILE:{json.dumps(file_data)}"
+                        self.add_to_history(file_message)
+                        self.broadcast_message(file_message)
+                    else:
+                        # Обычное текстовое сообщение
+                        nickname = self.clients.get(client_socket, "Unknown")
+                        full_message = f"{nickname}: {decrypted_message}"
+                        self.add_to_history(full_message)
+                        self.broadcast_message(full_message)
                     
-                    # Отправляем всем, включая отправителя
-                    encrypted_message = f.encrypt(full_message.encode())
-                    for client in self.clients:
-                        try:
-                            print(f"Отправка сообщения клиенту {self.clients[client]}")
-                            client.send(encrypted_message)
-                            print(f"Сообщение успешно отправлено клиенту {self.clients[client]}")
-                        except Exception as e:
-                            print(f"Ошибка отправки клиенту {self.clients[client]}: {e}")
-                            
                 except Exception as e:
                     print(f"Ошибка обработки сообщения: {str(e)}")
                     break
@@ -210,6 +216,12 @@ class ChatServer:
         for client_socket in list(self.clients.keys()):
             client_socket.close()
         print("Сервер остановлен")
+
+    def add_to_history(self, message):
+        """Добавляет сообщение в историю"""
+        self.message_history.append(message)
+        if len(self.message_history) > self.max_history:
+            self.message_history.pop(0)  # Удаляем самое старое сообщение
 
 if __name__ == "__main__":
     server = ChatServer()
